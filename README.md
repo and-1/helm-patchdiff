@@ -1,4 +1,4 @@
-# helm-patchdiff
+# helmdiff
 
 Generates a JSON patch diff based on the parameters that would be passed along to `helm upgrade`.
 
@@ -6,16 +6,22 @@ Generates a JSON patch diff based on the parameters that would be passed along t
 
 ```console
 $ go build
-$ ./helm-patchdiff RELEASE_NAME CHART_NAME
+$ ./helmdiff RELEASE_NAME CHART_NAME
 ```
 
 ## Example
 
 ```console
-$ helm create foo
-$ helm install foo ./foo
-$ ./helm-patchdiff foo ./foo/
-[{},{},{}]
-$ ./helm-patchdiff foo ./foo/ --set replicaCount=3
-[{},{},{"spec":{"replicas":3}}]
+$ helm create test
+$ helm install test ./test
+$ ./helmdiff test ./test/
+$ ./helmdiff test ./test/ --set replicaCount=3
+- action: patch
+  namespace: default
+  object: deployments/test
+  patch:
+    spec:
+      replicas: 3
+
+Changes in release test detected
 ```

@@ -12,6 +12,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
+	"gopkg.in/yaml.v2"
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/chart"
 	"helm.sh/helm/v3/pkg/chart/loader"
@@ -36,9 +37,14 @@ import (
 var settings = cli.New()
 
 func main() {
+	var (
+		suppressSecretPatch bool
+		disableValidation   bool
+	)
 	valueOpts := &values.Options{}
+	changes := false
 	var rootCmd = &cobra.Command{
-		Use:   "patchdiff <NAME> <CHART> [options]",
+		Use:   "helmdiff <NAME> <CHART>",
 		Short: "Preview helm upgrade changes as a JSON patch",
 		Long:  "Preview helm upgrade changes as a JSON patch",
 		Args:  cobra.ExactArgs(2),
@@ -60,16 +66,59 @@ func main() {
 				log.Fatal(err)
 			}
 
-			patchset, err := createPatchset(name, ch, vals)
+			patchset, err := createPatchset(name, ch, vals, suppressSecretPatch, disableValidation)
 			if err != nil {
 				log.Fatal(err)
 			}
-			fmt.Println(patchset)
+
+			dec := json.NewDecoder(strings.NewReader(patchset))
+			var patchlist []interface{}
+			if err := dec.Decode(&patchlist); err != nil {
+				log.Fatal(err)
+			}
+
+			if len(patchlist) > 0 {
+				changes = true
+			} else {
+				return nil
+			}
+
+			outputFlag := cmd.Flag("output")
+			switch outputFlag.Value.String() {
+			case "json":
+				output, err := json.MarshalIndent(&patchlist, "", "  ")
+				if err != nil {
+					log.Fatalf("error: %v", err)
+				}
+				fmt.Printf("%s\n", string(output))
+			case "yaml":
+				output, err := yaml.Marshal(&patchlist)
+				if err != nil {
+					log.Fatalf("error: %v", err)
+				}
+				fmt.Printf("%s\n", string(output))
+			case "quiet":
+				if changes == true {
+					os.Exit(2)
+				}
+			default:
+				log.Fatalf("Output 'type' %s is not supported", outputFlag.Value.String())
+			}
+
+			if changes == true {
+				fmt.Printf("Changes in release %s detected\n", name)
+				os.Exit(2)
+			}
+
 			return nil
 		},
 	}
 
 	f := rootCmd.Flags()
+	f.StringP("output", "o", "yaml", fmt.Sprintf("prints the output in the specified format. Allowed values: json, yaml, quiet"))
+	f.BoolVar(&suppressSecretPatch, "suppress-secrets-patch", false, "suppress secrets in the output")
+	f.BoolVar(&disableValidation, "disable-openapi-validation", false, "Don't validate against OpenAPI schema")
+	settings.AddFlags(f)
 	addValueOptionsFlags(f, valueOpts)
 
 	if err := rootCmd.Execute(); err != nil {
@@ -77,8 +126,9 @@ func main() {
 	}
 }
 
-func createPatchset(name string, ch *chart.Chart, vals map[string]interface{}) (string, error) {
+func createPatchset(name string, ch *chart.Chart, vals map[string]interface{}, suppressSecretPatch bool, disableValidation bool) (string, error) {
 	patches := []string{}
+	patchstring := ""
 
 	actionConfig := new(action.Configuration)
 	if err := actionConfig.Init(settings.RESTClientGetter(), settings.Namespace(), os.Getenv("HELM_DRIVER"), log.Printf); err != nil {
@@ -94,13 +144,19 @@ func createPatchset(name string, ch *chart.Chart, vals map[string]interface{}) (
 		return "", err
 	}
 
-	original, err := actionConfig.KubeClient.Build(bytes.NewBufferString(originalManifest), false)
+	original, err := actionConfig.KubeClient.Build(bytes.NewBufferString(originalManifest), !disableValidation)
 	if err != nil {
 		return "", errors.Wrap(err, "unable to build kubernetes objects from original release manifest")
 	}
-	target, err := actionConfig.KubeClient.Build(bytes.NewBufferString(targetManifest), false)
+	target, err := actionConfig.KubeClient.Build(bytes.NewBufferString(targetManifest), !disableValidation)
 	if err != nil {
 		return "", errors.Wrap(err, "unable to build kubernetes objects from new release manifest")
+	}
+
+	deleted := original.Difference(target)
+	for _, objInfo := range deleted {
+		patchstring = fmt.Sprintf("{\"action\": \"delete\", \"object\": \"%s\", \"namespace\": \"%s\", \"patch\": {}}", objInfo.ObjectName(), objInfo.Namespace)
+		patches = append(patches, string(patchstring))
 	}
 
 	err = target.Visit(func(info *resource.Info, err error) error {
@@ -108,9 +164,24 @@ func createPatchset(name string, ch *chart.Chart, vals map[string]interface{}) (
 			return err
 		}
 
+		showSecrets := true
+		if info.Mapping.Resource.Resource == "secrets" && suppressSecretPatch {
+			showSecrets = false
+		}
+
 		helper := resource.NewHelper(info.Client, info.Mapping)
 		if _, err := helper.Get(info.Namespace, info.Name, info.Export); apierrors.IsNotFound(err) {
-			// no patch to generate
+			//handle new objects
+			manifest, err := json.Marshal(info.Object)
+			if err != nil {
+				return errors.Wrap(err, "unable to marshal new added kubernetes resources")
+			}
+			if showSecrets {
+				patchstring = fmt.Sprintf("{\"action\": \"create\", \"object\": \"%s\", \"namespace\": \"%s\", \"patch\": %s}", info.ObjectName(), info.Namespace, manifest)
+			} else {
+				patchstring = fmt.Sprintf("{\"action\": \"create\", \"object\": \"%s\", \"namespace\": \"%s\", \"patch\": \"SECRET PATCH WAS SUPPRESSED\"}", info.ObjectName(), info.Namespace)
+			}
+			patches = append(patches, string(patchstring))
 			return nil
 		}
 
@@ -124,8 +195,14 @@ func createPatchset(name string, ch *chart.Chart, vals map[string]interface{}) (
 			return err
 		}
 
-		// append patch to patchset
-		patches = append(patches, string(patch))
+		if len(patch) > 2 {
+			if showSecrets {
+				patchstring = fmt.Sprintf("{\"action\": \"patch\", \"object\": \"%s\", \"namespace\": \"%s\", \"patch\": %s}", info.ObjectName(), info.Namespace, patch)
+			} else {
+				patchstring = fmt.Sprintf("{\"action\": \"patch\", \"object\": \"%s\", \"namespace\": \"%s\", \"patch\": \"SECRET PATCH WAS SUPPRESSED\"}", info.ObjectName(), info.Namespace)
+			}
+			patches = append(patches, string(patchstring))
+		}
 		return nil
 	})
 
