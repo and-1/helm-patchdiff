@@ -6,7 +6,7 @@ Generates a JSON patch diff based on the parameters that would be passed along t
 
 ```console
 $ go build
-$ ./helmdiff RELEASE_NAME CHART_NAME
+$ ./helmdiff upgrade RELEASE_NAME CHART_NAME
 ```
 
 ## Example
@@ -14,8 +14,8 @@ $ ./helmdiff RELEASE_NAME CHART_NAME
 ```console
 $ helm create test
 $ helm install test ./test
-$ ./helmdiff test ./test/
-$ ./helmdiff test ./test/ --set replicaCount=3
+$ ./helmdiff upgrade test ./test/
+$ ./helmdiff upgrade test ./test/ --set replicaCount=3
 - action: patch
   namespace: default
   object: deployments/test

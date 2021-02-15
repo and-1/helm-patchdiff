@@ -40,14 +40,16 @@ func main() {
 	var (
 		suppressSecretPatch bool
 		disableValidation   bool
+		allowUnreleased     bool
+		detailedExitCode    bool
 	)
 	valueOpts := &values.Options{}
 	changes := false
 	var rootCmd = &cobra.Command{
-		Use:   "helmdiff <NAME> <CHART>",
+		Use:   "helmdiff upgrade <NAME> <CHART>",
 		Short: "Preview helm upgrade changes as a JSON patch",
 		Long:  "Preview helm upgrade changes as a JSON patch",
-		Args:  cobra.ExactArgs(2),
+		Args:  cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			name := args[0]
 			if err := validateReleaseName(name); err != nil {
@@ -55,6 +57,11 @@ func main() {
 			}
 
 			chartPath := args[1]
+
+			action := args[2]
+			if action != "upgrade" {
+				log.Fatal("Only 'upgrade' command supported")
+			}
 
 			vals, err := valueOpts.MergeValues(getter.All(settings))
 			if err != nil {
@@ -66,7 +73,8 @@ func main() {
 				log.Fatal(err)
 			}
 
-			patchset, err := createPatchset(name, ch, vals, suppressSecretPatch, disableValidation)
+			namespace := cmd.Flag("namespace").Value.String()
+			patchset, err := createPatchset(name, ch, vals, suppressSecretPatch, disableValidation, allowUnreleased, namespace)
 			if err != nil {
 				log.Fatal(err)
 			}
@@ -98,14 +106,14 @@ func main() {
 				}
 				fmt.Printf("%s\n", string(output))
 			case "quiet":
-				if changes == true {
+				if changes == true && detailedExitCode {
 					os.Exit(2)
 				}
 			default:
 				log.Fatalf("Output 'type' %s is not supported", outputFlag.Value.String())
 			}
 
-			if changes == true {
+			if changes == true && detailedExitCode {
 				fmt.Printf("Changes in release %s detected\n", name)
 				os.Exit(2)
 			}
@@ -118,6 +126,9 @@ func main() {
 	f.StringP("output", "o", "yaml", fmt.Sprintf("prints the output in the specified format. Allowed values: json, yaml, quiet"))
 	f.BoolVar(&suppressSecretPatch, "suppress-secrets-patch", false, "suppress secrets in the output")
 	f.BoolVar(&disableValidation, "disable-openapi-validation", false, "Don't validate against OpenAPI schema")
+	f.BoolVar(&allowUnreleased, "allow-unreleased", false, "Allow diff unreleased release")
+	f.BoolVar(&detailedExitCode, "detailed-exitcode", false, "return a non-zero exit code when there are changes")
+	f.Bool("reset-values", false, "Not implemented. Used only for compatibility with helmfile")
 	settings.AddFlags(f)
 	addValueOptionsFlags(f, valueOpts)
 
@@ -126,7 +137,7 @@ func main() {
 	}
 }
 
-func createPatchset(name string, ch *chart.Chart, vals map[string]interface{}, suppressSecretPatch bool, disableValidation bool) (string, error) {
+func createPatchset(name string, ch *chart.Chart, vals map[string]interface{}, suppressSecretPatch bool, disableValidation bool, allowUnreleased bool, namespace string) (string, error) {
 	patches := []string{}
 	patchstring := ""
 
@@ -139,7 +150,7 @@ func createPatchset(name string, ch *chart.Chart, vals map[string]interface{}, s
 		return "", err
 	}
 
-	originalManifest, targetManifest, err := prepareUpgrade(actionConfig, name, ch, vals)
+	originalManifest, targetManifest, err := prepareUpgrade(actionConfig, name, ch, vals, allowUnreleased, namespace)
 	if err != nil {
 		return "", err
 	}
@@ -209,51 +220,60 @@ func createPatchset(name string, ch *chart.Chart, vals map[string]interface{}, s
 	return fmt.Sprintf("[%s]", strings.Join(patches, ",")), err
 }
 
-func prepareUpgrade(c *action.Configuration, name string, chart *chart.Chart, vals map[string]interface{}) (string, string, error) {
+func prepareUpgrade(c *action.Configuration, name string, chart *chart.Chart, vals map[string]interface{}, allowUnreleased bool, namespace string) (string, string, error) {
 	if chart == nil {
 		return "", "", errors.New("missing chart")
 	}
 
+	newRelease := false
+
 	// finds the last non-deleted release with the given name
 	lastRelease, err := c.Releases.Last(name)
 	if err != nil {
-		// to keep existing behavior of returning the "%q has no deployed releases" error when an existing release does not exist
 		if errors.Is(err, driver.ErrReleaseNotFound) {
-			return "", "", driver.NewErrNoDeployedReleases(name)
+			if allowUnreleased {
+				newRelease = true
+			} else {
+				return "", "", driver.NewErrNoDeployedReleases(name)
+			}
+		} else {
+			return "", "", err
 		}
-		return "", "", err
 	}
 
+	options := chartutil.ReleaseOptions{
+		Name:      name,
+		Namespace: namespace,
+	}
+
+	var oldManifests string
 	var currentRelease *release.Release
-	if lastRelease.Info.Status == release.StatusDeployed {
-		// no need to retrieve the last deployed release from storage as the last release is deployed
-		currentRelease = lastRelease
+	if newRelease {
+		options.Revision = 1
+		options.IsInstall = true
+		oldManifests = ""
 	} else {
-		// finds the deployed release with the given name
-		currentRelease, err = c.Releases.Deployed(name)
-		if err != nil {
-			if errors.Is(err, driver.ErrNoDeployedReleases) &&
-				(lastRelease.Info.Status == release.StatusFailed || lastRelease.Info.Status == release.StatusSuperseded) {
-				currentRelease = lastRelease
-			} else {
-				return "", "", err
+		if lastRelease.Info.Status == release.StatusDeployed {
+			// no need to retrieve the last deployed release from storage as the last release is deployed
+			currentRelease = lastRelease
+		} else {
+			// finds the deployed release with the given name
+			currentRelease, err = c.Releases.Deployed(name)
+			if err != nil {
+				if errors.Is(err, driver.ErrNoDeployedReleases) &&
+					(lastRelease.Info.Status == release.StatusFailed || lastRelease.Info.Status == release.StatusSuperseded) {
+					currentRelease = lastRelease
+				} else {
+					return "", "", err
+				}
 			}
 		}
+		options.Revision = lastRelease.Version + 1
+		options.IsUpgrade = true
 	}
 
 	if err := chartutil.ProcessDependencies(chart, vals); err != nil {
 		return "", "", err
-	}
-
-	// Increment revision count. This is passed to templates, and also stored on
-	// the release object.
-	revision := lastRelease.Version + 1
-
-	options := chartutil.ReleaseOptions{
-		Name:      name,
-		Namespace: currentRelease.Namespace,
-		Revision:  revision,
-		IsUpgrade: true,
 	}
 
 	if err := getCapabilities(c); err != nil {
@@ -269,7 +289,10 @@ func prepareUpgrade(c *action.Configuration, name string, chart *chart.Chart, va
 		return "", "", err
 	}
 
-	return currentRelease.Manifest, manifestDoc.String(), err
+	if !newRelease {
+		oldManifests = currentRelease.Manifest
+	}
+	return oldManifests, manifestDoc.String(), err
 }
 
 // capabilities builds a Capabilities from discovery information.
