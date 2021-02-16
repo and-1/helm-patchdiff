@@ -51,14 +51,14 @@ func main() {
 		Long:  "Preview helm upgrade changes as a JSON patch",
 		Args:  cobra.ExactArgs(3),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			name := args[0]
+			action := args[0]
+			name := args[1]
 			if err := validateReleaseName(name); err != nil {
 				log.Fatal(err)
 			}
 
-			chartPath := args[1]
+			chartPath := args[2]
 
-			action := args[2]
 			if action != "upgrade" {
 				log.Fatal("Only 'upgrade' command supported")
 			}
@@ -423,6 +423,21 @@ func createPatch(current runtime.Object, target *resource.Info) ([]byte, types.P
 	}
 
 	patch, err := strategicpatch.CreateThreeWayMergePatch(oldData, newData, currentData, patchMeta, true)
+	if string(patch) != "{}" {
+		//Revalidate, sometime mess present in patch
+		newDryRunObj, err := helper.Patch(target.Namespace, target.Name, types.StrategicMergePatchType, newData, nil)
+		newDryRun, err := json.Marshal(newDryRunObj)
+		if err != nil {
+			return nil, types.StrategicMergePatchType, errors.Wrap(err, "serializing target configuration")
+		}
+		oldDryRunObj, err := helper.Patch(target.Namespace, target.Name, types.StrategicMergePatchType, oldData, nil)
+		oldDryRun, err := json.Marshal(oldDryRunObj)
+		if err != nil {
+			return nil, types.StrategicMergePatchType, errors.Wrap(err, "serializing origin configuration")
+		}
+		patch, err = strategicpatch.CreateThreeWayMergePatch(filterFields(oldDryRun), filterFields(newDryRun), currentData, patchMeta, true)
+	}
+
 	return patch, types.StrategicMergePatchType, err
 }
 
@@ -444,4 +459,40 @@ func addValueOptionsFlags(f *pflag.FlagSet, v *values.Options) {
 	f.StringArrayVar(&v.Values, "set", []string{}, "set values on the command line (can specify multiple or separate values with commas: key1=val1,key2=val2)")
 	f.StringArrayVar(&v.StringValues, "set-string", []string{}, "set STRING values on the command line (can specify multiple or separate values with commas: key1=val1,key2=val2)")
 	f.StringArrayVar(&v.FileValues, "set-file", []string{}, "set values from respective files specified via the command line (can specify multiple or separate values with commas: key1=path1,key2=path2)")
+}
+
+func filterFields(patch []byte) []byte {
+	var filterMap = map[string]interface{}{
+		"metadata": map[string]interface{}{
+			"generation":      "",
+			"resourceVersion": "",
+			"managedFields":   ""},
+	}
+	dec := json.NewDecoder(strings.NewReader(string(patch)))
+	var objectMap map[string]interface{}
+	if err := dec.Decode(&objectMap); err != nil {
+		log.Fatal(err)
+	}
+	newMap := cleaningMap(objectMap, filterMap)
+	newMapJson, err := json.Marshal(newMap)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return newMapJson
+}
+
+func cleaningMap(source map[string]interface{}, filter map[string]interface{}) map[string]interface{} {
+	for k, v := range filter {
+		if val, ok := source[k]; ok {
+			switch v.(type) {
+			case map[string]interface{}:
+				source[k] = cleaningMap(val.(map[string]interface{}), v.(map[string]interface{}))
+			case string:
+				delete(source, k)
+			default:
+				log.Fatal("Not supported filterMap structure to handle")
+			}
+		}
+	}
+	return source
 }
