@@ -180,9 +180,9 @@ func createPatchset(name string, ch *chart.Chart, vals map[string]interface{}, s
 			showSecrets = false
 		}
 
-		helper := resource.NewHelper(info.Client, info.Mapping)
-		if _, err := helper.Get(info.Namespace, info.Name, info.Export); apierrors.IsNotFound(err) {
-			//handle new objects
+		originalInfo := original.Get(info)
+		if originalInfo == nil {
+			//Handle new resources
 			manifest, err := json.Marshal(info.Object)
 			if err != nil {
 				return errors.Wrap(err, "unable to marshal new added kubernetes resources")
@@ -194,11 +194,6 @@ func createPatchset(name string, ch *chart.Chart, vals map[string]interface{}, s
 			}
 			patches = append(patches, string(patchstring))
 			return nil
-		}
-
-		originalInfo := original.Get(info)
-		if originalInfo == nil {
-			return fmt.Errorf("could not find %q", info.Name)
 		}
 
 		patch, _, err := createPatch(originalInfo.Object, info)
@@ -388,6 +383,7 @@ func createPatch(current runtime.Object, target *resource.Info) ([]byte, types.P
 
 	// Fetch the current object for the three way merge
 	helper := resource.NewHelper(target.Client, target.Mapping)
+	helper.DryRun(true)
 	currentObj, err := helper.Get(target.Namespace, target.Name, target.Export)
 	if err != nil && !apierrors.IsNotFound(err) {
 		return nil, types.StrategicMergePatchType, errors.Wrapf(err, "unable to get data for current object %s/%s", target.Namespace, target.Name)

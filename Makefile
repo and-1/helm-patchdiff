@@ -1,9 +1,10 @@
-HELM_PLUGINS ?= $(shell helm env | awk -F\= '/HELM_PLUGINS/{print $2}' | tr -d \" )
+HELM_PLUGINS ?= $(shell helm env | awk -F\= '/HELM_PLUGINS/{print $$2}' | tr -d \" )
 
 
 .PHONY: build
 build:
 	mkdir -p bin/
+	rm -f bin/helmdiff
 	go build -i -v -o bin/helmdiff -ldflags="$(LDFLAGS)"
 
 .PHONY: install
