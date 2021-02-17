@@ -126,6 +126,7 @@ func main() {
 	f.StringP("output", "o", "yaml", fmt.Sprintf("prints the output in the specified format. Allowed values: json, yaml, quiet"))
 	f.BoolVar(&suppressSecretPatch, "suppress-secrets-patch", false, "suppress secrets in the output")
 	f.BoolVar(&disableValidation, "disable-openapi-validation", false, "Don't validate against OpenAPI schema")
+	f.BoolVar(&disableValidation, "disable-validation", false, "Don't validate against OpenAPI schema")
 	f.BoolVar(&allowUnreleased, "allow-unreleased", false, "Allow diff unreleased release")
 	f.BoolVar(&detailedExitCode, "detailed-exitcode", false, "return a non-zero exit code when there are changes")
 	f.Bool("reset-values", false, "Not implemented. Used only for compatibility with helmfile")
